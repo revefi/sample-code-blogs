@@ -1,0 +1,12 @@
+Task: for GitHub repository acme/widgets, pull request #25471, list the review threads that are still UNRESOLVED.
+
+Definitions: a review thread is one root inline review comment plus all replies to it. GitHub tracks a resolved/unresolved state per thread. Only unresolved threads count. Ignore the PR description and general (non-inline) PR comments.
+
+For each unresolved thread report: file path, line, the root comment's numeric id, how many comments the thread has, and the author and full text of the LAST comment in the thread.
+
+Strictly read-only: do not reply, resolve, edit, react, or change anything on the PR or the repository.
+
+Keep working until you have the answer, then end your reply with exactly one fenced JSON block of this shape and nothing after it:
+```json
+{"unresolved_threads":[{"path":"...","line":0,"root_comment_id":0,"comments":0,"last_author":"...","last_body":"..."}]}
+```

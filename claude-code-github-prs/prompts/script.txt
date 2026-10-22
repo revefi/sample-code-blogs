@@ -1,0 +1,5 @@
+A checked-in script is available in this directory for exactly this job:
+
+    python3 scripts/pr_unresolved_threads.py acme/widgets 25471
+
+It prints the UNRESOLVED review threads, one JSON object per line: {"root_comment_id", "path", "line", "comments", "thread": [{"id", "author", "body"}, ...]} with the thread's comments in order. Run it and answer from its output.

@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""Mocked `gh` that replays recorded GitHub responses for acme/widgets PR 25471 (anonymized from a real PR).
+
+Supports: gh api <path> [--paginate] [--slurp] [-X METHOD] [-f k=v] [-F k=v] [--jq EXPR]
+          gh api graphql -f query=... [-f/-F var=...]   (executed against a mini schema)
+          gh auth status, gh repo view --json owner,name, gh pr view 25471 --json ...
+Every call is appended to $GH_SHIM_LOG as one JSON line.
+"""
+import json, os, re, subprocess, sys, time, urllib.parse
+
+FIX = os.environ.get("GH_FIXTURES") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fixtures")
+LOG = os.environ.get("GH_SHIM_LOG")
+
+def load(name):
+    with open(os.path.join(FIX, name)) as f:
+        return json.load(f)
+
+def log(kind, detail, nbytes, status):
+    if LOG:
+        with open(LOG, "a") as f:
+            f.write(json.dumps({"t": time.time(), "kind": kind, "detail": detail, "bytes": nbytes, "status": status}) + "\n")
+
+def die(msg, code=1):
+    sys.stderr.write(msg + "\n")
+    sys.exit(code)
+
+# ---------------------------------------------------------------- REST
+def rest(method, path, params):
+    path = path.strip("/")
+    if path.startswith("repos/acme/widgets/"):
+        p = path[len("repos/acme/widgets/"):]
+    elif path == "repos/acme/widgets":
+        p = ""
+    else:
+        return 404, {"message": "Not Found", "documentation_url": "https://docs.github.com/rest", "status": "404"}
+    if method != "GET":
+        return 403, {"message": "Resource not accessible: this sandbox is read-only", "status": "403"}
+    lists = {
+        "pulls/25471/comments": "pull_comments.json",
+        "pulls/25471/reviews": "reviews.json",
+        "issues/25471/comments": "issue_comments.json",
+    }
+    singles = {"": "repo.json", "pulls/25471": "pull.json", "issues/25471": "issue.json"}
+    if p in singles:
+        return 200, load(singles[p])
+    if p in lists:
+        return 200, paginate(load(lists[p]), params)
+    m = re.match(r"pulls/comments/(\d+)$", p)
+    if m:
+        for c in load("pull_comments.json"):
+            if c["id"] == int(m.group(1)): return 200, c
+        return 404, {"message": "Not Found", "status": "404"}
+    m = re.match(r"pulls/25471/reviews/(\d+)/comments$", p)
+    if m:
+        rid = int(m.group(1))
+        return 200, paginate([c for c in load("pull_comments.json") if c.get("pull_request_review_id") == rid], params)
+    m = re.match(r"pulls/25471/reviews/(\d+)$", p)
+    if m:
+        for r in load("reviews.json"):
+            if r["id"] == int(m.group(1)): return 200, r
+    return 404, {"message": "Not Found", "documentation_url": "https://docs.github.com/rest", "status": "404"}
+
+def paginate(items, params):
+    per = int(params.get("per_page", 30)); page = int(params.get("page", 1))
+    per = max(1, min(per, 100))
+    return items[(page - 1) * per: page * per]
+
+# ---------------------------------------------------------------- GraphQL
+def graphql(query, variables):
+    from graphql import build_schema, graphql_sync
+    data = load("graphql_pr.json")["data"]
+    repo = data["repository"]; pr = repo["pullRequest"]
+    threads = pr["reviewThreads"]["nodes"]
+    all_comments = [c for t in threads for c in t["comments"]["nodes"]]
+    sdl = """
+    scalar BigInt
+    type Query { repository(owner:String!, name:String!): Repository  viewer: User!  node(id:ID!): Node  rateLimit: RateLimit }
+    type RateLimit { limit:Int! cost:Int! remaining:Int! resetAt:String! }
+    type User implements Node & Actor { id:ID! login:String! }
+    interface Node { id:ID! }
+    interface Actor { login:String! }
+    type Repository implements Node { id:ID! name:String! nameWithOwner:String! owner:Actor! pullRequest(number:Int!): PullRequest }
+    type PullRequest implements Node { id:ID! databaseId:BigInt number:Int! title:String! state:String! url:String! isDraft:Boolean! merged:Boolean!
+      baseRefName:String! headRefName:String! headRefOid:String! reviewDecision:String author:Actor createdAt:String! updatedAt:String! totalCommentsCount:Int
+      reviewThreads(first:Int, after:String, last:Int, before:String): PullRequestReviewThreadConnection!
+      reviews(first:Int, after:String, last:Int, states:[String!]): PullRequestReviewConnection!
+      comments(first:Int, after:String, last:Int): IssueCommentConnection! }
+    type PageInfo { hasNextPage:Boolean! hasPreviousPage:Boolean! startCursor:String endCursor:String }
+    type PullRequestReviewThreadConnection { totalCount:Int! pageInfo:PageInfo! nodes:[PullRequestReviewThread] edges:[PullRequestReviewThreadEdge] }
+    type PullRequestReviewThreadEdge { cursor:String! node:PullRequestReviewThread }
+    type PullRequestReviewThread implements Node { id:ID! isResolved:Boolean! isOutdated:Boolean! isCollapsed:Boolean! path:String! line:Int originalLine:Int startLine:Int originalStartLine:Int
+      diffSide:String! subjectType:String! viewerCanResolve:Boolean! viewerCanUnresolve:Boolean! viewerCanReply:Boolean! resolvedBy:Actor pullRequest:PullRequest!
+      comments(first:Int, after:String, last:Int): PullRequestReviewCommentConnection! }
+    type PullRequestReviewCommentConnection { totalCount:Int! pageInfo:PageInfo! nodes:[PullRequestReviewComment] edges:[PullRequestReviewCommentEdge] }
+    type PullRequestReviewCommentEdge { cursor:String! node:PullRequestReviewComment }
+    type PullRequestReviewComment implements Node { id:ID! databaseId:BigInt body:String! bodyText:String! author:Actor createdAt:String! updatedAt:String! publishedAt:String url:String! path:String!
+      line:Int originalLine:Int originalPosition:Int position:Int outdated:Boolean! isMinimized:Boolean! state:String! diffHunk:String! commit:Commit originalCommit:Commit
+      replyTo:PullRequestReviewComment pullRequestReview:PullRequestReview viewerCanDelete:Boolean! viewerCanUpdate:Boolean! }
+    type Commit { oid:String! }
+    type PullRequestReview implements Node { id:ID! databaseId:BigInt state:String! body:String! author:Actor submittedAt:String url:String! comments(first:Int, after:String): PullRequestReviewCommentConnection! }
+    type PullRequestReviewConnection { totalCount:Int! pageInfo:PageInfo! nodes:[PullRequestReview] }
+    type IssueComment implements Node { id:ID! databaseId:BigInt body:String! author:Actor createdAt:String! url:String! }
+    type IssueCommentConnection { totalCount:Int! pageInfo:PageInfo! nodes:[IssueComment] }
+    """
+    schema = build_schema(sdl)
+    byid = {}
+    def reg(o):
+        if isinstance(o, dict):
+            if "id" in o: byid.setdefault(o["id"], o)
+            for v in o.values(): reg(v)
+        elif isinstance(o, list):
+            for v in o: reg(v)
+    reg(data)
+    def conn(items, args):
+        first, after, last, before = args.get("first"), args.get("after"), args.get("last"), args.get("before")
+        if first is None and last is None:
+            raise Exception("You must provide a `first` or `last` value to properly paginate this connection.")
+        if (first or 0) > 100 or (last or 0) > 100:
+            raise Exception("Requesting %d records on a connection exceeds the `first` limit of 100 records." % max(first or 0, last or 0))
+        idx = list(range(len(items)))
+        if after: idx = [i for i in idx if i > int(after.split(":")[1])]
+        if before: idx = [i for i in idx if i < int(before.split(":")[1])]
+        if first is not None: sel = idx[:first]
+        else: sel = idx[-last:]
+        return {"totalCount": len(items),
+                "pageInfo": {"hasNextPage": bool(sel) and sel[-1] < len(items) - 1, "hasPreviousPage": bool(sel) and sel[0] > 0,
+                             "startCursor": f"cursor:{sel[0]}" if sel else None, "endCursor": f"cursor:{sel[-1]}" if sel else None},
+                "nodes": [items[i] for i in sel], "edges": [{"cursor": f"cursor:{i}", "node": items[i]} for i in sel]}
+
+    reviews_rest = load("reviews.json"); issue_rest = load("issue_comments.json")
+    reviews_gql = [{"id": r["node_id"], "databaseId": r["id"], "state": r["state"], "body": r["body"], "author": {"login": r["user"]["login"], "id": r["user"]["node_id"]},
+                    "submittedAt": r.get("submitted_at"), "url": r["html_url"],
+                    "comments": {"nodes": [c for c in all_comments if (c.get("pullRequestReview") or {}).get("databaseId") == r["id"]]}} for r in reviews_rest]
+    issue_gql = [{"id": c["node_id"], "databaseId": c["id"], "body": c["body"], "author": {"login": c["user"]["login"], "id": c["user"]["node_id"]}, "createdAt": c["created_at"], "url": c["html_url"]} for c in issue_rest]
+
+    class Root: pass
+    def typename(obj, info, _t):
+        if "login" in obj: return "User"
+        if "isResolved" in obj: return "PullRequestReviewThread"
+        if "diffHunk" in obj: return "PullRequestReviewComment"
+        if "nameWithOwner" in obj: return "Repository"
+        if "number" in obj: return "PullRequest"
+        return "User"
+    for n in ("Node", "Actor"): schema.get_type(n).resolve_type = typename
+    Q = schema.get_type("Query").fields
+    Q["repository"].resolve = lambda _r, _i, owner, name: repo if (owner, name) == ("acme", "widgets") else None
+    Q["viewer"].resolve = lambda _r, _i: {"id": "U_viewer", "login": "me"}
+    Q["node"].resolve = lambda _r, _i, id: byid.get(id)
+    Q["rateLimit"].resolve = lambda _r, _i: {"limit": 5000, "cost": 1, "remaining": 4990, "resetAt": "2026-01-15T00:00:00Z"}
+    PR = schema.get_type("PullRequest").fields
+    PR["reviewThreads"].resolve = lambda pr_, _i, **a: conn(threads, a)
+    PR["reviews"].resolve = lambda pr_, _i, **a: conn([r for r in reviews_gql if not a.get("states") or r["state"] in a["states"]], a)
+    PR["comments"].resolve = lambda pr_, _i, **a: conn(issue_gql, a)
+    T = schema.get_type("PullRequestReviewThread").fields
+    T["comments"].resolve = lambda t, _i, **a: conn(t["comments"]["nodes"], a)
+    T["pullRequest"].resolve = lambda t, _i: pr
+    R = schema.get_type("PullRequestReview").fields
+    R["comments"].resolve = lambda r, _i, **a: conn(r["comments"]["nodes"], a)
+    schema.get_type("PullRequestReviewComment").fields["replyTo"].resolve = lambda c, _i: byid.get((c.get("replyTo") or {}).get("id")) if c.get("replyTo") else None
+    schema.get_type("PullRequestReviewComment").fields["pullRequestReview"].resolve = lambda c, _i: next((r for r in reviews_gql if r["databaseId"] == (c.get("pullRequestReview") or {}).get("databaseId")), None)
+    res = graphql_sync(schema, query, variable_values=variables)
+    out = {}
+    if res.data is not None: out["data"] = res.data
+    if res.errors:
+        out["errors"] = [{"message": e.message, "locations": [{"line": l.line, "column": l.column} for l in (e.locations or [])], "path": e.path} for e in res.errors]
+        if res.data is None: out["data"] = None
+    return out
+
+# ---------------------------------------------------------------- CLI parsing
+def main(argv):
+    if not argv: die("gh: usage: gh <command> [flags]")
+    cmd = argv[0]
+    if cmd == "auth": print("github.com\n  ✓ Logged in to github.com account me (keyring)\n  - Active account: true\n  - Token scopes: 'repo', 'read:org'"); log("auth", "status", 0, 0); return 0
+    if cmd == "repo" and argv[1:2] == ["view"]: print(json.dumps({"owner": {"login": "acme"}, "name": "widgets"})); log("repo", "view", 0, 200); return 0
+    if cmd == "pr":
+        sub = argv[1] if len(argv) > 1 else ""
+        if sub == "view":
+            fields = None
+            for i, a in enumerate(argv):
+                if a == "--json": fields = argv[i + 1].split(",")
+            p = load("pull.json")
+            if fields:
+                mp = {"number": p["number"], "title": p["title"], "state": p["state"].upper(), "url": p["html_url"], "headRefName": p["head"]["ref"], "baseRefName": p["base"]["ref"], "author": {"login": p["user"]["login"]}, "isDraft": p["draft"], "body": p["body"], "reviewDecision": "", "id": p["node_id"], "headRefOid": p["head"]["sha"], "createdAt": p["created_at"], "updatedAt": p["updated_at"], "mergeable": p.get("mergeable"), "additions": p.get("additions"), "deletions": p.get("deletions"), "changedFiles": p.get("changed_files")}
+                unknown = [f for f in fields if f not in mp and f not in ("reviews", "comments", "reviewThreads")]
+                if "reviewThreads" in fields: die("Unknown JSON field: \"reviewThreads\"\nAvailable fields: additions, assignees, author, autoMergeRequest, baseRefName, body, changedFiles, closed, closedAt, comments, commits, createdAt, deletions, files, fullDatabaseId, headRefName, headRefOid, headRepository, headRepositoryOwner, id, isCrossRepository, isDraft, labels, latestReviews, maintainerCanModify, mergeCommit, mergeStateStatus, mergeable, mergedAt, mergedBy, milestone, number, potentialMergeCommit, projectCards, projectItems, reactionGroups, reviewDecision, reviewRequests, reviews, state, statusCheckRollup, title, updatedAt, url")
+                if unknown: die("Unknown JSON field: %s" % ", ".join('"%s"' % u for u in unknown))
+                out = {}
+                for f in fields:
+                    if f == "reviews": out[f] = [{"id": r["node_id"], "author": {"login": r["user"]["login"]}, "state": r["state"], "body": r["body"], "submittedAt": r.get("submitted_at")} for r in load("reviews.json")]
+                    elif f == "comments": out[f] = [{"id": c["node_id"], "author": {"login": c["user"]["login"]}, "body": c["body"], "createdAt": c["created_at"]} for c in load("issue_comments.json")]
+                    else: out[f] = mp[f]
+                s = json.dumps(out); print(s); log("pr", "view --json " + ",".join(fields), len(s), 200); return 0
+            s = "%s #%d\nOpen • %s wants to merge into %s from %s\n\n%s" % (p["title"], p["number"], p["user"]["login"], p["base"]["ref"], p["head"]["ref"], p["body"] or "")
+            print(s); log("pr", "view", len(s), 200); return 0
+        die("gh pr %s: not available in this sandbox (read-only)" % sub)
+    if cmd != "api": die("unknown command %r for \"gh\"" % cmd)
+
+    args = argv[1:]; method = "GET"; fields = {}; rawfields = {}; jqexpr = None; template = None; pag = False; slurp = False; path = None; inp = None; 
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-X", "--method"): method = args[i + 1].upper(); i += 2
+        elif a.startswith("--method="): method = a.split("=", 1)[1].upper(); i += 1
+        elif a in ("-f", "--raw-field"): k, _, v = args[i + 1].partition("="); rawfields[k] = v; i += 2
+        elif a in ("-F", "--field"): k, _, v = args[i + 1].partition("="); fields[k] = v; i += 2
+        elif a in ("-q", "--jq"): jqexpr = args[i + 1]; i += 2
+        elif a.startswith("--jq="): jqexpr = a.split("=", 1)[1]; i += 1
+        elif a in ("-t", "--template"): template = args[i + 1]; i += 2
+        elif a == "--paginate": pag = True; i += 1
+        elif a == "--slurp": slurp = True; i += 1
+        elif a in ("-H", "--header"): i += 2
+        elif a == "--cache": i += 2
+        elif a in ("-i", "--include", "--silent", "--verbose"): i += 1
+        elif a == "--input": inp = args[i + 1]; i += 2
+        elif a.startswith("-"): die("unknown flag: %s" % a)
+        else: path = a; i += 1
+    if path is None: die("gh api: a path is required")
+    if template is not None: die("gh api: --template is not available in this sandbox; use --jq or pipe to jq")
+
+    def typed(v):
+        if v in ("true", "false"): return v == "true"
+        if v == "null": return None
+        if re.fullmatch(r"-?\d+", v): return int(v)
+        if v.startswith("@"): return open(v[1:]).read()
+        return v
+
+    if path.lstrip("/") == "graphql":
+        if method == "GET": method = "POST"
+        variables = {k: v for k, v in rawfields.items() if k != "query"}
+        variables.update({k: typed(v) for k, v in fields.items() if k != "query"})
+        query = rawfields.get("query") or fields.get("query")
+        if inp:
+            body = json.load(sys.stdin if inp == "-" else open(inp)); query = body.get("query", query); variables.update(body.get("variables") or {})
+        if not query: die("gh: graphql query is required")
+        if re.search(r"\bmutation\b", query): 
+            out = {"data": None, "errors": [{"message": "Resource not accessible by integration (read-only sandbox)", "type": "FORBIDDEN"}]}
+            s = json.dumps(out); print(s); log("graphql", "MUTATION " + query[:200], len(s), 403); return 1
+        pages = []
+        while True:
+            out = graphql(query, variables)
+            pages.append(out)
+            if not pag: break
+            # gh --paginate follows the first pageInfo{hasNextPage endCursor} it finds, feeding endCursor into $endCursor
+            pi = find_pageinfo(out.get("data"))
+            if not pi or not pi.get("hasNextPage") or "$endCursor" not in query: break
+            variables["endCursor"] = pi["endCursor"]
+        return emit(pages, jqexpr, slurp, "graphql", query, 200)
+
+    # REST
+    parsed = urllib.parse.urlsplit(path); params = dict(urllib.parse.parse_qsl(parsed.query))
+    params.update({k: v for k, v in rawfields.items()}); params.update({k: v for k, v in fields.items()})
+    pages = []; status = 200; page = int(params.get("page", 1))
+    while True:
+        status, body = rest(method, parsed.path, dict(params, page=page))
+        pages.append(body)
+        if status != 200:
+            s = json.dumps(body, indent=2) if not jqexpr else json.dumps(body)
+            print(s); log("rest", "%s %s" % (method, path), len(s), status)
+            sys.stderr.write("gh: %s (HTTP %d)\n" % (body.get("message"), status)); return 1
+        if not pag or not isinstance(body, list) or len(body) < max(1, min(int(params.get("per_page", 30)), 100)): break
+        page += 1
+    return emit(pages, jqexpr, slurp, "rest", "%s %s%s" % (method, path, " --paginate" if pag else ""), status)
+
+def find_pageinfo(d):
+    if isinstance(d, dict):
+        if "pageInfo" in d and isinstance(d["pageInfo"], dict): return d["pageInfo"]
+        for v in d.values():
+            r = find_pageinfo(v)
+            if r: return r
+    elif isinstance(d, list):
+        for v in d:
+            r = find_pageinfo(v)
+            if r: return r
+    return None
+
+def emit(pages, jqexpr, slurp, kind, detail, status):
+    if slurp: pages = [pages]
+    chunks = []
+    for p in pages:
+        # GitHub returns indented JSON on REST and compact JSON on GraphQL; the difference shows up in token counts
+        s = json.dumps(p) if kind == "graphql" or jqexpr else json.dumps(p, indent=2)
+        if jqexpr:
+            r = subprocess.run(["jq", "-c", "-r", jqexpr], input=s, capture_output=True, text=True)
+            if r.returncode != 0: sys.stderr.write(r.stderr); log(kind, detail + " --jq " + jqexpr, 0, "jq-error"); return r.returncode
+            chunks.append(r.stdout.rstrip("\n"))
+        else:
+            chunks.append(s)
+    out = "\n".join(chunks)
+    sys.stdout.write(out + ("\n" if out else ""))
+    log(kind, detail + (" --jq " + jqexpr if jqexpr else ""), len(out), status)
+    # like gh: a GraphQL response carrying errors prints the body and exits 1
+    return 1 if kind == "graphql" and any(isinstance(p, dict) and "errors" in p for p in pages) else 0
+
+if __name__ == "__main__":
+    try: sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError: sys.exit(0)
+    except SystemExit: raise
+    except Exception as e: sys.stderr.write("gh: internal error: %s: %s\n" % (type(e).__name__, e)); sys.exit(1)
